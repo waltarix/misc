@@ -2,11 +2,10 @@
 
 # frozen_string_literal: true
 
-require 'oj'
 require 'pty'
 require 'socket'
 
-Oj.default_options = { mode: :compat }
+require 'fast_jsonparser'
 
 SOCKET_PATH = '/tmp/jxa-daemon.sock'
 
@@ -34,7 +33,7 @@ module JXADaemon # :nodoc:
 
     def options
       @options ||= begin
-                     Oj.load(@raw_code, symbol_keys: true)
+                     FastJsonparser.parse(@raw_code)
                    rescue StandardError
                      {}
                    end
