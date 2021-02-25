@@ -2,16 +2,33 @@
 
 # frozen_string_literal: true
 
-require 'oj'
+require 'delegate'
 require 'pty'
 require 'socket'
 
+require 'oj'
 Oj.default_options = { mode: :compat }
 
-SOCKET_PATH = '/tmp/jxa-daemon.sock'
+module JXADaemon
+  SOCKET_PATH = '/tmp/jxa-daemon.sock'
 
-module JXADaemon # :nodoc:
-  class Code # :nodoc:
+  using(Module.new do
+    refine Numeric do
+      def megabytes
+        self * 1024 * 1024
+      end
+    end
+  end)
+
+  module PS
+    module_function
+
+    def rss_bytes(pid)
+      `ps -o 'rss=' -p #{pid.to_i}`.strip.to_i * 1024
+    end
+  end
+
+  class Code
     class << self
       def call(code)
         new(code).runnable_code
@@ -53,7 +70,25 @@ module JXADaemon # :nodoc:
     end
   end
 
-  class Runner # :nodoc:
+  class ExpirableRunner < SimpleDelegator
+    MEMORY_LIMIT = ENV.fetch('JXA_MEMORY_LIMIT', 64).to_i.megabytes
+
+    def call(code)
+      super.tap do
+        cleanup if memory_limit_exceed?
+      end
+    end
+
+    private
+
+    def memory_limit_exceed?
+      PS.rss_bytes(pid) > MEMORY_LIMIT
+    end
+  end
+
+  class Runner
+    attr_reader :pid
+
     class << self
       def instance
         @instance ||= new
@@ -63,8 +98,12 @@ module JXADaemon # :nodoc:
         instance.exec(code)
       end
 
+      def pid
+        instance.pid
+      end
+
       def cleanup
-        instance.cleanup
+        instance.cleanup.tap { @instance = nil }
       end
     end
 
@@ -82,18 +121,25 @@ module JXADaemon # :nodoc:
     end
 
     def cleanup
-      Process.kill(:TERM, @pid) if @pid
+      return unless pid
+
+      Process.detach(pid)
+      Process.kill(:TERM, pid).tap do
+        @reader&.close
+        @writer&.close
+        @pid = nil
+      end
     end
   end
 
-  module Daemon # :nodoc:
+  module Daemon
     module_function
 
     def run!(socket_path = SOCKET_PATH)
       setup
       Socket.unix_server_loop(socket_path) do |s, _c|
         code = s.recv(2**16)
-        s.puts(Runner.call(code))
+        s.puts(runner.call(code))
         s.close
       end
     rescue Errno::EPIPE
@@ -101,7 +147,11 @@ module JXADaemon # :nodoc:
     end
 
     def setup
-      Signal.trap(:TERM) { Runner.cleanup }
+      Signal.trap(:TERM) { runner.cleanup }
+    end
+
+    def runner
+      @runner ||= ExpirableRunner.new(Runner)
     end
   end
 end
